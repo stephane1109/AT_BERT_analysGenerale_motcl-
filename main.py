@@ -32,11 +32,11 @@ var_debug = True
 text_widget = None
 
 # Variables Tkinter
-pooling_method = None
-var_intra = None
-var_stopwords = None
-var_lemmatisation = None
-analysis_mode = None
+pooling_method = None      # "mean", "weighted", "max", "attention", "sif"
+var_intra = None           # bool: ajouter des arêtes intracommunautaires
+var_stopwords = None       # bool: utiliser stopwords
+var_lemmatisation = None   # bool: utiliser la lemmatisation
+analysis_mode = None       # "mot_cle" ou "general"
 
 def afficher_message(msg):
     global text_widget
@@ -174,13 +174,13 @@ def encoder_phrase(phrase):
         return weighted_embeds.cpu().numpy().squeeze(0)
     elif method == "sif":
         a = 0.001
-        tokens_pretraite = phrase_pretraitee.split()
-        if len(tokens_pretraite) == 0:
+        tokens_pretraitee = phrase_pretraitee.split()
+        if len(tokens_pretraitee) == 0:
             return outputs.last_hidden_state.mean(dim=1).cpu().numpy().squeeze(0)
         from collections import Counter
-        counts = Counter(tokens_pretraite)
-        total_tokens = len(tokens_pretraite)
-        sif_weights_list = [a / (a + counts[token] / total_tokens) for token in tokens_pretraite]
+        counts = Counter(tokens_pretraitee)
+        total_tokens = len(tokens_pretraitee)
+        sif_weights_list = [a / (a + counts[token] / total_tokens) for token in tokens_pretraitee]
         tokens_ids = inputs['input_ids'][0]
         tokens_from_ids = tokenizer.convert_ids_to_tokens(tokens_ids)
         if tokens_from_ids[0] in tokenizer.all_special_tokens:
@@ -275,28 +275,38 @@ def construire_graphe_general(freq_dict, embeddings_cache, threshold):
     return G
 
 def colorer_communautes(G, freq_dict):
+    """
+    Détecte les communautés (Louvain) et assigne une couleur
+    à chaque nœud. On stocke la fréquence et la couleur dans G.nodes[node].
+    """
     partition = community_louvain.best_partition(G)
     palette = ["#8A2BE2", "#9370DB", "#BA55D3", "#DA70D6", "#D8BFD8"]
     for node in G.nodes():
         comm = partition.get(node, 0)
         color = palette[comm % len(palette)]
-        freq = freq_dict.get(node, "N/A")
+        freq = freq_dict.get(node, 0)
         G.nodes[node]["frequency"] = freq
         G.nodes[node]["color"] = color
     return G, partition
 
+
 def assigner_layout_etoile(G, central, centre=(300,300), rayon=300):
+    """
+    Place le nœud central au centre,
+    et répartit ses voisins en cercle de rayon=rayon autour.
+    """
     positions = {central: {"x": centre[0], "y": centre[1]}}
     voisins = list(G.neighbors(central))
     n = len(voisins)
     if n > 0:
-        angle_gap = 2*math.pi / n
+        angle_gap = 2 * math.pi / n
         for i, node in enumerate(voisins):
             angle = i * angle_gap
             x = centre[0] + rayon * math.cos(angle)
             y = centre[1] + rayon * math.sin(angle)
             positions[node] = {"x": x, "y": y}
     return positions
+
 
 def assigner_layout_classique(G):
     positions = nx.spring_layout(G, seed=42)
@@ -305,37 +315,42 @@ def assigner_layout_classique(G):
         positions_dict[node] = {"x": float(coord[0]*1000), "y": float(coord[1]*1000)}
     return positions_dict
 
+
 def nx_vers_pyvis_motcle(G, positions, central):
     """
-    Graphe circulaire pour l'analyse par mot-clé :
-      - Mot-clé (central) en blanc
-      - Autres nœuds en violet
-      - Arêtes en blanc
+    Crée un graphique Pyvis pour le mode mot-clé sous forme d'étoile :
+      - Le mot-clé central est en blanc.
+      - Tous les autres nœuds sont en violet et de même taille.
+      - L'épaisseur des arêtes est proportionnelle au score de similarité (sim * 30).
+      - Le titre de chaque arête affiche le score de similarité.
     """
     net = Network(height="800px", width="100%", bgcolor="#222222", font_color="white")
     net.set_options('{ "physics": { "enabled": false } }')
 
+    fixed_size = 30  # Taille fixe pour tous les nœuds
+    factor = 30  # Facteur pour augmenter l'épaisseur des arêtes
+
     for node in G.nodes():
         freq = G.nodes[node].get("frequency", 0)
-        if node.lower() == central.lower():
-            color = "#FFFFFF"  # blanc pour le mot-clé
-        else:
-            color = "#8A2BE2"  # violet
         label = f"{node}\nFreq: {freq}"
-        if isinstance(freq, (int, float)):
-            size = 20 + freq*2
+        if node.lower() == central.lower():
+            color = "#FFFFFF"  # mot-clé en blanc
         else:
-            size = 20
-        pos = positions.get(node, {"x":300, "y":300})
-        net.add_node(node, label=label, title=label, x=pos["x"], y=pos["y"],
-                     color=color, size=size)
+            color = "#8A2BE2"  # violet pour les autres
+        pos = positions.get(node, {"x": 300, "y": 300})
+        net.add_node(node, label=label, title=label,
+                     x=pos["x"], y=pos["y"], color=color, size=fixed_size)
 
-    # Arêtes blanches
     for u, v, data in G.edges(data=True):
         sim = data.get("weight", 0)
-        net.add_edge(u, v, title=f"Sim: {sim:.4f}", color="#FFFFFF")
+        # Convertir sim en float Python
+        sim = float(sim)
+        edge_thickness = sim * factor
+        edge_color = data.get("color", "#FFFFFF")
+        net.add_edge(u, v, title=f"Sim: {sim:.4f}", value=edge_thickness, color=edge_color)
 
     return net
+
 
 def nx_vers_pyvis_general(G, positions):
     """
@@ -373,32 +388,72 @@ def sauvegarder_resultats(voisins, filename):
                     f.write(f"    {passage}\n")
             f.write("\n")
 
-def creer_graphe(voisins, mot_cle, freq_dict):
+def creer_graphe_motcle(voisins, mot_cle, freq_dict):
+    """
+    Crée un graphe en étoile :
+      - mot_cle au centre
+      - chaque voisin relié au mot_cle
+    """
     G = nx.Graph()
-    G.add_node(mot_cle, frequency=freq_dict.get(mot_cle, "N/A"))
+    # Ajouter le nœud central
+    G.add_node(mot_cle, frequency=freq_dict.get(mot_cle, 0))
+    # Ajouter chaque voisin
     for voisin, sim, _ in voisins:
         if voisin.lower() == mot_cle.lower():
             continue
-        G.add_node(voisin, frequency=freq_dict.get(voisin, "N/A"))
+        G.add_node(voisin, frequency=freq_dict.get(voisin, 0))
+        # Arête star
         G.add_edge(mot_cle, voisin, weight=sim)
     return G
 
-def ajouter_aretes_intercommunautaires_motcle(G, central):
+
+def ajouter_aretes_intercommunautaires_motcle(G, central, embeddings_cache):
     """
-    Méthode intracommunautaire spéciale pour le mode mot-clé.
-    Par exemple, on peut relier les hubs de chaque communauté
-    par une unique arête grise, sauf la communauté du mot-clé central.
+    Pour chaque communauté (excluant le mot-clé central),
+    détermine le hub (le nœud de degré maximum dans cette communauté)
+    et ajoute une unique arête grise reliant ce hub aux autres nœuds de la même communauté.
+    Le poids de l'arête est calculé par la similarité cosinus entre le hub et l'autre nœud.
     """
-    # ... code similaire à 'ajouter_aretes_intercommunautaires' ...
-    # Personnalisez si nécessaire
+    partition = community_louvain.best_partition(G)
+    communities = {}
+    for node, comm in partition.items():
+        if node.lower() == central.lower():
+            continue
+        communities.setdefault(comm, []).append(node)
+
+    for comm, nodes in communities.items():
+        if not nodes:
+            continue
+        # Choisir le hub comme nœud de degré maximum
+        hub = max(nodes, key=lambda n: G.degree[n])
+        for node in nodes:
+            if node == hub:
+                continue
+            if not G.has_edge(hub, node):
+                sim = cosine_similarity(embeddings_cache[hub][0], embeddings_cache[node][0])
+                # On multiplie par un facteur (ici 10) pour obtenir des arêtes plus épaisses
+                G.add_edge(hub, node, weight=sim, color="gray", value=sim * 10)
     return G
+
 
 def ajouter_aretes_intercommunautaires_general(G, embeddings_cache):
     """
-    Méthode intracommunautaire pour l'analyse générale,
-    éventuellement un autre critère de sélection.
+    Méthode intracommunautaire pour l'analyse générale.
+    Vous pouvez la personnaliser selon votre logique.
     """
-    # ... un code spécifique pour le mode général ...
+    partition = community_louvain.best_partition(G)
+    # Exemple : pour chaque communauté, on choisit un hub, puis on les relie
+    hubs = {}
+    for node, comm in partition.items():
+        if comm not in hubs or G.degree[node] > G.degree[hubs[comm]]:
+            hubs[comm] = node
+    hub_list = list(hubs.values())
+    for i in range(len(hub_list)):
+        for j in range(i+1, len(hub_list)):
+            hub1 = hub_list[i]
+            hub2 = hub_list[j]
+            if not G.has_edge(hub1, hub2):
+                G.add_edge(hub1, hub2, weight=0, color="gray")
     return G
 
 # ----------------------------------------------------------------------------
@@ -409,38 +464,42 @@ def analyser_fichier_mot_cle(texte):
     mot_cle = entry_noeud_central.get().strip().lower()
     afficher_message(f"Analyse du mot-clé : {mot_cle}")
 
-    embedding_keyword = encoder_contextuel_simplifie(texte, mot_cle)
-    norm_keyword = np.linalg.norm(embedding_keyword)
-    afficher_message(f"Embedding du mot-clé (norme) : {norm_keyword:.4f}")
+    # Embedding du mot-clé
+    emb_keyword = encoder_contextuel_simplifie(texte, mot_cle)
+    afficher_message(f"Embedding du mot-clé (norme) : {np.linalg.norm(emb_keyword):.4f}")
 
-    voisins, freq_dict, cache = construire_voisins_contextuel(texte, mot_cle, embedding_keyword)
-    try:
-        nb_voisins = int(entry_voisins.get())
-    except:
-        nb_voisins = NB_NEIGHBORS_DEFAULT
+    # Extraction des voisins
+    voisins, freq_dict, cache = construire_voisins_contextuel(texte, mot_cle, emb_keyword)
+    nb_voisins = int(entry_voisins.get()) if entry_voisins.get().isdigit() else NB_NEIGHBORS_DEFAULT
     voisins = voisins[:nb_voisins]
     afficher_message(f"{len(voisins)} voisins positifs sélectionnés.")
+
+    # Sauvegarder la liste des voisins
     sauvegarder_resultats(voisins, "context_neighbors.txt")
     afficher_message("Fichier texte généré : context_neighbors.txt")
 
-    G = creer_graphe(voisins, mot_cle, freq_dict)
-    # Colorer (optionnel)
+    # Construire le graphe étoile
+    G = creer_graphe_motcle(voisins, mot_cle, freq_dict)
+
+    # Colorer les communautés
     G, partition = colorer_communautes(G, freq_dict)
 
-    # Arêtes intracommunautaires
+    # Ajouter des arêtes intracommunautaires si coché
     if var_intra.get():
-        # On peut appeler la méthode spéciale mot-clé
-        G = ajouter_aretes_intercommunautaires_motcle(G, mot_cle)
-        afficher_message("Arêtes intracommunautaires mot-clé ajoutées.")
+        G = ajouter_aretes_intercommunautaires_motcle(G, mot_cle, cache)
+        afficher_message("Arêtes intracommunautaires (hub) ajoutées.")
 
-    # Layout en étoile
+    # Positionnement en étoile (mot-clé au centre)
     positions = assigner_layout_etoile(G, mot_cle)
-    # Conversion Pyvis mot-clé
+
+    # Conversion Pyvis (mot-clé blanc, arêtes blanches star, arêtes gris intracommunautaires)
     net = nx_vers_pyvis_motcle(G, positions, mot_cle)
 
-    html_file = "graph.html"
+    # Générer le HTML
+    html_file = "graph_keyword.html"
     net.write_html(html_file)
     afficher_message("Graphique généré : " + os.path.abspath(html_file))
+
 
 # ----------------------------------------------------------------------------
 # Analyser mode général
@@ -470,7 +529,6 @@ def analyser_fichier_general(texte):
     G_final, partition = colorer_communautes(G_final, freq_dict)
 
     if var_intra.get():
-        # On peut appeler la méthode spéciale générale
         G_final = ajouter_aretes_intercommunautaires_general(G_final, embeddings_cache)
         afficher_message("Arêtes intracommunautaires général ajoutées.")
 
@@ -522,7 +580,7 @@ def analyser_fichier():
 
 root = tk.Tk()
 root.title("Analyse textuelle – Choix du mode d'analyse")
-root.geometry("800x800")
+root.geometry("700x1100")
 
 analysis_mode = tk.StringVar(value="mot_cle")
 frame_mode = ttk.LabelFrame(root, text="Mode d'analyse", padding="10")
