@@ -233,7 +233,10 @@ def encoder_terme_par_contexte(terme, texte):
     return np.mean(embeddings, axis=0), context_sentences
 
 def cosine_similarity(v1, v2):
-    return np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+    sim = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+    # Remplacer les valeurs négatives par 0
+    return max(sim, 0)
+
 
 # ----------------------
 # Construction de graphes
